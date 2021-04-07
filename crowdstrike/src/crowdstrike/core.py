@@ -3,25 +3,30 @@
 
 import os
 import time
-from typing import Dict, Any, Optional, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 import yaml
-from crowdstrike_client.client import CrowdStrikeClient
-from pycti import OpenCTIConnectorHelper
-from pycti.connector.opencti_connector_helper import get_config_variable
-from stix2 import (
-    Identity,
-    TLP_RED,
-    MarkingDefinition,
-    TLP_WHITE,
-    TLP_GREEN,
-    TLP_AMBER,
-)
 
-from crowdstrike.actors import ActorImporter
-from crowdstrike.indicators import IndicatorImporter
-from crowdstrike.reports import ReportImporter
-from crowdstrike.utils import create_organization
+from crowdstrike_client.client import CrowdStrikeClient
+
+from pycti import OpenCTIConnectorHelper  # type: ignore
+from pycti.connector.opencti_connector_helper import get_config_variable  # type: ignore
+
+from stix2 import Identity, MarkingDefinition  # type: ignore
+
+from crowdstrike.actor.importer import ActorImporter
+from crowdstrike.importer import BaseImporter
+from crowdstrike.indicator.importer import IndicatorImporter
+from crowdstrike.report.importer import ReportImporter
+from crowdstrike.rule.yara_master_importer import YaraMasterImporter
+from crowdstrike.utils import (
+    convert_comma_separated_str_to_list,
+    create_organization,
+    get_tlp_string_marking_definition,
+    is_timestamp_in_future,
+    timestamp_to_datetime,
+)
+from crowdstrike.utils.constants import DEFAULT_TLP_MARKING_DEFINITION
 
 
 class CrowdStrike:
@@ -33,23 +38,25 @@ class CrowdStrike:
     _CONFIG_CLIENT_ID = f"{_CONFIG_NAMESPACE}.client_id"
     _CONFIG_CLIENT_SECRET = f"{_CONFIG_NAMESPACE}.client_secret"
     _CONFIG_INTERVAL_SEC = f"{_CONFIG_NAMESPACE}.interval_sec"
+    _CONFIG_SCOPES = f"{_CONFIG_NAMESPACE}.scopes"
     _CONFIG_TLP = f"{_CONFIG_NAMESPACE}.tlp"
+    _CONFIG_CREATE_OBSERVABLES = f"{_CONFIG_NAMESPACE}.create_observables"
+    _CONFIG_CREATE_INDICATORS = f"{_CONFIG_NAMESPACE}.create_indicators"
     _CONFIG_ACTOR_START_TIMESTAMP = f"{_CONFIG_NAMESPACE}.actor_start_timestamp"
     _CONFIG_REPORT_START_TIMESTAMP = f"{_CONFIG_NAMESPACE}.report_start_timestamp"
     _CONFIG_REPORT_INCLUDE_TYPES = f"{_CONFIG_NAMESPACE}.report_include_types"
     _CONFIG_REPORT_STATUS = f"{_CONFIG_NAMESPACE}.report_status"
     _CONFIG_REPORT_TYPE = f"{_CONFIG_NAMESPACE}.report_type"
+    _CONFIG_REPORT_GUESS_MALWARE = f"{_CONFIG_NAMESPACE}.report_guess_malware"
     _CONFIG_INDICATOR_START_TIMESTAMP = f"{_CONFIG_NAMESPACE}.indicator_start_timestamp"
     _CONFIG_INDICATOR_EXCLUDE_TYPES = f"{_CONFIG_NAMESPACE}.indicator_exclude_types"
 
     _CONFIG_UPDATE_EXISTING_DATA = "connector.update_existing_data"
 
-    _CONFIG_TLP_MAPPING = {
-        "white": TLP_WHITE,
-        "green": TLP_GREEN,
-        "amber": TLP_AMBER,
-        "red": TLP_RED,
-    }
+    _CONFIG_SCOPE_ACTOR = "actor"
+    _CONFIG_SCOPE_REPORT = "report"
+    _CONFIG_SCOPE_INDICATOR = "indicator"
+    _CONFIG_SCOPE_YARA_MASTER = "yara_master"
 
     _CONFIG_REPORT_STATUS_MAPPING = {
         "new": 0,
@@ -58,15 +65,17 @@ class CrowdStrike:
         "closed": 3,
     }
 
-    _DEFAULT_REPORT_TYPE = "Threat Report"
+    _DEFAULT_CREATE_OBSERVABLES = True
+    _DEFAULT_CREATE_INDICATORS = True
+    _DEFAULT_REPORT_TYPE = "threat-report"
+
+    _CONNECTOR_RUN_INTERVAL_SEC = 60
 
     _STATE_LAST_RUN = "last_run"
 
     def __init__(self) -> None:
         """Initialize CrowdStrike connector."""
         config = self._read_configuration()
-
-        self.helper = OpenCTIConnectorHelper(config)
 
         # CrowdStrike connector configuration
         base_url = self._get_configuration(config, self._CONFIG_BASE_URL)
@@ -77,19 +86,44 @@ class CrowdStrike:
             config, self._CONFIG_INTERVAL_SEC, is_number=True
         )
 
+        scopes_str = self._get_configuration(config, self._CONFIG_SCOPES)
+        scopes = set()
+        if scopes_str is not None:
+            scopes = set(convert_comma_separated_str_to_list(scopes_str))
+
         tlp = self._get_configuration(config, self._CONFIG_TLP)
-        self.tlp_marking = self._convert_tlp_to_marking_definition(tlp)
+        tlp_marking = self._convert_tlp_to_marking_definition(tlp)
+
+        create_observables = self._get_configuration(
+            config, self._CONFIG_CREATE_OBSERVABLES
+        )
+        if create_observables is None:
+            create_observables = self._DEFAULT_CREATE_OBSERVABLES
+        else:
+            create_observables = bool(create_observables)
+
+        create_indicators = self._get_configuration(
+            config, self._CONFIG_CREATE_INDICATORS
+        )
+        if create_indicators is None:
+            create_indicators = self._DEFAULT_CREATE_INDICATORS
+        else:
+            create_indicators = bool(create_indicators)
 
         actor_start_timestamp = self._get_configuration(
             config, self._CONFIG_ACTOR_START_TIMESTAMP, is_number=True
         )
+        if is_timestamp_in_future(actor_start_timestamp):
+            raise ValueError("Actor start timestamp is in the future")
 
         report_start_timestamp = self._get_configuration(
             config, self._CONFIG_REPORT_START_TIMESTAMP, is_number=True
         )
+        if is_timestamp_in_future(report_start_timestamp):
+            raise ValueError("Report start timestamp is in the future")
 
         report_status_str = self._get_configuration(config, self._CONFIG_REPORT_STATUS)
-        self.report_status = self._convert_report_status_str_to_report_status_int(
+        report_status = self._convert_report_status_str_to_report_status_int(
             report_status_str
         )
 
@@ -101,66 +135,106 @@ class CrowdStrike:
             config, self._CONFIG_REPORT_INCLUDE_TYPES
         )
         report_include_types = []
-        if report_include_types_str:
-            report_include_types = [
-                x.strip() for x in report_include_types_str.split(",")
-            ]
+        if report_include_types_str is not None:
+            report_include_types = convert_comma_separated_str_to_list(
+                report_include_types_str
+            )
+
+        report_guess_malware = bool(
+            self._get_configuration(config, self._CONFIG_REPORT_GUESS_MALWARE)
+        )
 
         indicator_start_timestamp = self._get_configuration(
             config, self._CONFIG_INDICATOR_START_TIMESTAMP, is_number=True
         )
+        if is_timestamp_in_future(indicator_start_timestamp):
+            raise ValueError("Indicator start timestamp is in the future")
 
         indicator_exclude_types_str = self._get_configuration(
             config, self._CONFIG_INDICATOR_EXCLUDE_TYPES
         )
         indicator_exclude_types = []
-        if indicator_exclude_types_str:
-            indicator_exclude_types = [
-                x.strip() for x in indicator_exclude_types_str.split(",")
-            ]
+        if indicator_exclude_types_str is not None:
+            indicator_exclude_types = convert_comma_separated_str_to_list(
+                indicator_exclude_types_str
+            )
 
-        update_existing_data = self._get_configuration(
-            config, self._CONFIG_UPDATE_EXISTING_DATA
+        update_existing_data = bool(
+            self._get_configuration(config, self._CONFIG_UPDATE_EXISTING_DATA)
         )
 
-        # Create CrowdStrike client and importers
-        self.client = CrowdStrikeClient(base_url, client_id, client_secret)
+        author = self._create_author()
 
-        self.author = self._create_author()
+        # Create OpenCTI connector helper.
+        self.helper = OpenCTIConnectorHelper(config)
 
-        self.actor_importer = ActorImporter(
-            self.helper,
-            self.client.intel_api.actors,
-            update_existing_data,
-            self.author,
-            actor_start_timestamp,
-            self.tlp_marking,
-        )
+        # Create CrowdStrike client and importers.
+        client = CrowdStrikeClient(base_url, client_id, client_secret)
 
-        self.report_importer = ReportImporter(
-            self.helper,
-            self.client.intel_api.reports,
-            update_existing_data,
-            self.author,
-            report_start_timestamp,
-            self.tlp_marking,
-            report_include_types,
-            self.report_status,
-            report_type,
-        )
+        # Create importers.
+        importers: List[BaseImporter] = []
 
-        self.indicator_importer = IndicatorImporter(
-            self.helper,
-            self.client.intel_api.indicators,
-            self.client.intel_api.reports,
-            update_existing_data,
-            self.author,
-            indicator_start_timestamp,
-            self.tlp_marking,
-            indicator_exclude_types,
-            self.report_status,
-            report_type,
-        )
+        if self._CONFIG_SCOPE_ACTOR in scopes:
+            actor_importer = ActorImporter(
+                self.helper,
+                client.intel_api.actors,
+                update_existing_data,
+                author,
+                actor_start_timestamp,
+                tlp_marking,
+            )
+
+            importers.append(actor_importer)
+
+        if self._CONFIG_SCOPE_REPORT in scopes:
+            report_importer = ReportImporter(
+                self.helper,
+                client.intel_api.reports,
+                update_existing_data,
+                author,
+                report_start_timestamp,
+                tlp_marking,
+                report_include_types,
+                report_status,
+                report_type,
+                report_guess_malware,
+            )
+
+            importers.append(report_importer)
+
+        if self._CONFIG_SCOPE_INDICATOR in scopes:
+            indicator_importer = IndicatorImporter(
+                self.helper,
+                client.intel_api.indicators,
+                client.intel_api.reports,
+                update_existing_data,
+                author,
+                indicator_start_timestamp,
+                tlp_marking,
+                create_observables,
+                create_indicators,
+                indicator_exclude_types,
+                report_status,
+                report_type,
+            )
+
+            importers.append(indicator_importer)
+
+        if self._CONFIG_SCOPE_YARA_MASTER in scopes:
+            yara_master_importer = YaraMasterImporter(
+                self.helper,
+                client.intel_api.rules,
+                client.intel_api.reports,
+                author,
+                tlp_marking,
+                update_existing_data,
+                report_status,
+                report_type,
+            )
+
+            importers.append(yara_master_importer)
+
+        self.importers = importers
 
     @staticmethod
     def _read_configuration() -> Dict[str, str]:
@@ -193,15 +267,16 @@ class CrowdStrike:
         return config_value
 
     @classmethod
-    def _convert_tlp_to_marking_definition(cls, tlp_value: str) -> MarkingDefinition:
-        return cls._CONFIG_TLP_MAPPING[tlp_value.lower()]
+    def _convert_tlp_to_marking_definition(
+        cls, tlp_value: Optional[str]
+    ) -> MarkingDefinition:
+        if tlp_value is None:
+            return DEFAULT_TLP_MARKING_DEFINITION
+        return get_tlp_string_marking_definition(tlp_value)
 
     @classmethod
     def _convert_report_status_str_to_report_status_int(cls, report_status: str) -> int:
         return cls._CONFIG_REPORT_STATUS_MAPPING[report_status.lower()]
-
-    def get_interval(self) -> int:
-        return int(self.interval_sec)
 
     def _load_state(self) -> Dict[str, Any]:
         current_state = self.helper.get_state()
@@ -217,19 +292,37 @@ class CrowdStrike:
             return state.get(key, default)
         return default
 
+    @classmethod
+    def _sleep(cls, delay_sec: Optional[int] = None) -> None:
+        sleep_delay = (
+            delay_sec if delay_sec is not None else cls._CONNECTOR_RUN_INTERVAL_SEC
+        )
+        time.sleep(sleep_delay)
+
     def _is_scheduled(self, last_run: Optional[int], current_time: int) -> bool:
         if last_run is None:
+            self._info("CrowdStrike connector clean run")
             return True
+
         time_diff = current_time - last_run
-        return time_diff >= self.get_interval()
+        return time_diff >= self._get_interval()
 
     @staticmethod
     def _current_unix_timestamp() -> int:
         return int(time.time())
 
     def run(self):
-        self.helper.log_info("Starting CrowdStrike connector...")
+        """Run CrowdStrike connector."""
+        self._info("Starting CrowdStrike connector...")
+
+        if not self.importers:
+            self._error("Scope(s) not configured.")
+            return
+
         while True:
+            self._info("Running CrowdStrike connector...")
+            run_interval = self._CONNECTOR_RUN_INTERVAL_SEC
+
             try:
                 timestamp = self._current_unix_timestamp()
                 current_state = self._load_state()
@@ -238,35 +331,64 @@ class CrowdStrike:
 
                 last_run = self._get_state_value(current_state, self._STATE_LAST_RUN)
                 if self._is_scheduled(last_run, timestamp):
-                    actor_importer_state = self.actor_importer.run(current_state)
-                    report_importer_state = self.report_importer.run(current_state)
-                    indicator_importer_state = self.indicator_importer.run(
-                        current_state
-                    )
+                    work_id = self._initiate_work(timestamp)
 
                     new_state = current_state.copy()
-                    new_state.update(actor_importer_state)
-                    new_state.update(report_importer_state)
-                    new_state.update(indicator_importer_state)
+
+                    for importer in self.importers:
+                        importer_state = importer.start(work_id, current_state)
+                        new_state.update(importer_state)
+
                     new_state[self._STATE_LAST_RUN] = self._current_unix_timestamp()
 
-                    self.helper.log_info(f"Storing new state: {new_state}")
+                    self._info("Storing new state: {0}", new_state)
 
                     self.helper.set_state(new_state)
 
-                    self.helper.log_info(
-                        f"State stored, next run in: {self.get_interval()} seconds"
-                    )
-                else:
-                    new_interval = self.get_interval() - (timestamp - last_run)
-                    self.helper.log_info(
-                        f"Connector will not run, next run in: {new_interval} seconds"
+                    message = (
+                        f"State stored, next run in: {self._get_interval()} seconds"
                     )
 
-                time.sleep(60)
+                    self._info(message)
+
+                    self._complete_work(work_id, message)
+                else:
+                    next_run = self._get_interval() - (timestamp - last_run)
+                    run_interval = min(run_interval, next_run)
+
+                    self._info(
+                        "Connector will not run, next run in: {0} seconds", next_run
+                    )
+
+                self._sleep(delay_sec=run_interval)
             except (KeyboardInterrupt, SystemExit):
-                self.helper.log_info("Connector stop")
+                self._info("CrowdStrike connector stopping...")
                 exit(0)
-            except Exception as e:
-                self.helper.log_error(str(e))
-                time.sleep(60)
+            except Exception as e:  # noqa: B902
+                self._error("CrowdStrike connector internal error: {0}", str(e))
+                self._sleep()
+
+    def _initiate_work(self, timestamp: int) -> str:
+        datetime_str = timestamp_to_datetime(timestamp)
+        friendly_name = f"{self.helper.connect_name} @ {datetime_str}"
+        work_id = self.helper.api.work.initiate_work(
+            self.helper.connect_id, friendly_name
+        )
+
+        self._info("New work '{0}' initiated", work_id)
+
+        return work_id
+
+    def _complete_work(self, work_id: str, message: str) -> None:
+        self.helper.api.work.to_processed(work_id, message)
+
+    def _get_interval(self) -> int:
+        return int(self.interval_sec)
+
+    def _info(self, msg: str, *args: Any) -> None:
+        fmt_msg = msg.format(*args)
+        self.helper.log_info(fmt_msg)
+
+    def _error(self, msg: str, *args: Any) -> None:
+        fmt_msg = msg.format(*args)
+        self.helper.log_error(fmt_msg)
